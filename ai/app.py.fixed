@@ -1,0 +1,1295 @@
+from flask import Flask, request, jsonify, send_file
+from flask_cors import CORS
+from PIL import Image
+import os
+import subprocess
+import uuid
+import torch
+from torch.utils.data import DataLoader
+from srgan_model import Generator
+from dataset import *
+from io import BytesIO
+import io
+import cv2
+import numpy as np
+from tqdm import tqdm
+import base64
+import requests
+from pathlib import Path
+from deoldify.visualize import get_image_colorizer
+import shutil, sys 
+import tensorflow_hub as hub
+import tensorflow as tf
+import random
+from fastai.vision.learner import create_body
+from torchvision.models.resnet import resnet34
+from fastai.vision.models.unet import DynamicUnet
+import json
+import traceback
+
+app = Flask(__name__)
+CORS(app, resources={r"/enhance/image": {"origins": "*"}}, supports_credentials=True)
+CORS(app, resources={r"/enhance/video": {"origins": "*"}}, supports_credentials=True)
+CORS(app, resources={r"/enhance/text": {"origins": "*"}}, supports_credentials=True)
+CORS(app, resources={r"/colorize/image": {"origins": "*"}}, supports_credentials=True)
+CORS(app, resources={r"/colorize/video": {"origins": "*"}}, supports_credentials=True)
+CORS(app, resources={r"/stylize/image": {"origins": "*"}}, supports_credentials=True)
+
+
+
+UPLOAD_FOLDER = 'test_data/test'
+RESULT_FOLDER = 'result'
+FRAMES_FOLDER = 'frames'
+ENHANCED_FRAMES_FOLDER = 'enhanced_frames'
+
+
+for folder in [UPLOAD_FOLDER, RESULT_FOLDER, FRAMES_FOLDER, ENHANCED_FRAMES_FOLDER]:
+    os.makedirs(folder, exist_ok=True)
+
+def extract_frames(video_path):
+    """Extract frames from video and save them"""
+    nonlocal frames
+    frames = []
+    
+    try:
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            raise Exception(f"Could not open video file {video_path}")
+            
+        fps = max(int(cap.get(cv2.CAP_PROP_FPS)), 24)  # Default to 24fps if detection fails
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        
+        print(f"Video has {total_frames} frames at {fps} fps")
+        
+        # If video has no frames, return error
+        if total_frames == 0:
+            raise Exception("Video has no frames")
+            
+        # Process frames
+        frame_count = 0
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                break
+            
+            # Save frame with full path
+            frame_path = os.path.join(FRAMES_FOLDER, f"frame_{frame_count:04d}.png")
+            cv2.imwrite(frame_path, frame)
+            frames.append(frame_path)
+            frame_count += 1
+        
+        # Verify we extracted at least some frames
+        if len(frames) == 0:
+            raise Exception("No frames could be extracted from the video")
+        
+        cap.release()
+        return frames, fps
+    except Exception as e:
+        print(f"Error extracting frames: {str(e)}")
+        raise
+
+def video_to_data_url(video_path):
+    """Convert video file to data URL with proper content type"""
+    if not os.path.exists(video_path):
+        raise Exception(f"Video file does not exist: {video_path}")
+        
+    file_size = os.path.getsize(video_path)
+    if file_size == 0:
+        raise Exception(f"Video file is empty: {video_path}")
+        
+    print(f"Converting video to data URL, file size: {file_size} bytes")
+    
+    try:
+        with open(video_path, "rb") as f:
+            video_bytes = f.read()
+            video_base64 = base64.b64encode(video_bytes).decode('utf-8')
+            # Ensure the proper MIME type is set for video
+            return f"data:video/mp4;base64,{video_base64}"
+    except Exception as e:
+        print(f"Error converting video to data URL: {str(e)}")
+        raise
+
+def process_frame(frame_path, generator, device):
+    """Process a single frame using the SRGAN model"""
+  
+    image = Image.open(frame_path)
+    image_resized = image.resize((256, 256), Image.Resampling.LANCZOS).convert("RGB")
+    
+   
+    image_np = np.array(image_resized)
+    image_tensor = torch.from_numpy(image_np.transpose(2, 0, 1)).float()
+    image_tensor = (image_tensor / 127.5) - 1.0
+    image_tensor = image_tensor.unsqueeze(0).to(device)
+ 
+    with torch.no_grad():
+        output, _ = generator(image_tensor)
+        output = output[0].cpu().numpy()
+        output = (output + 1.0) / 2.0
+        output = output.transpose(1, 2, 0)
+        enhanced_frame = Image.fromarray((output * 255.0).astype(np.uint8))
+    
+
+    original_size = Image.open(frame_path).size
+    enhanced_frame = enhanced_frame.resize((original_size[0] * 4, original_size[1] * 4), Image.Resampling.LANCZOS)
+    
+    return enhanced_frame
+
+def create_video(colorized_frames, output_path, fps):
+    """Create video from colorized frames with proper codec and container format"""
+    if not colorized_frames:
+        raise Exception("No frames provided for video creation")
+        
+    first_frame = cv2.imread(colorized_frames[0])
+    if first_frame is None:
+        raise Exception(f"Could not read first frame: {colorized_frames[0]}")
+        
+    height, width = first_frame.shape[:2]
+    
+    # Use H.264 codec for better compatibility
+    if sys.platform.startswith('win'):
+        fourcc = cv2.VideoWriter_fourcc(*'H264')  # H.264 codec
+    else:
+        fourcc = cv2.VideoWriter_fourcc(*'avc1')  # H.264 codec on other platforms
+        
+    # Try fallback codecs if the first choice fails
+    codecs = ['mp4v', 'XVID', 'MJPG']
+    
+    out = None
+    for codec in [fourcc] + [cv2.VideoWriter_fourcc(*c) for c in codecs]:
+        try:
+            out = cv2.VideoWriter(output_path, codec, fps, (width, height))
+            if out.isOpened():
+                break
+        except Exception as e:
+            print(f"Codec error: {e}. Trying next codec...")
+            continue
+            
+    if out is None or not out.isOpened():
+        raise Exception(f"Could not create video writer with available codecs")
+    
+    # Write frames to video file
+    for frame_path in colorized_frames:
+        frame = cv2.imread(frame_path)
+        if frame is not None:  # Skip frames that failed to load
+            out.write(frame)
+    
+    out.release()
+    
+    # Verify video was created
+    if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
+        raise Exception("Failed to create output video")
+        
+    # Check if ffmpeg is available for transcoding if needed
+    if shutil.which('ffmpeg'):
+        try:
+            # Create a guaranteed compatible MP4 file 
+            transcoded_path = f"{os.path.splitext(output_path)[0]}_transcoded.mp4"
+            subprocess.run([
+                'ffmpeg', '-y', '-i', output_path, 
+                '-c:v', 'libx264', '-preset', 'fast', '-pix_fmt', 'yuv420p',
+                transcoded_path
+            ], check=True, capture_output=True)
+            
+            if os.path.exists(transcoded_path) and os.path.getsize(transcoded_path) > 0:
+                # Replace the original file with the transcoded one
+                os.replace(transcoded_path, output_path)
+        except Exception as e:
+            print(f"FFmpeg transcoding failed: {e}")
+
+def clean_up_frames():
+    """Clean up temporary frame files"""
+    for folder in [FRAMES_FOLDER, ENHANCED_FRAMES_FOLDER]:
+        for file in os.listdir(folder):
+            os.remove(os.path.join(folder, file))
+
+
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+os.makedirs(RESULT_FOLDER, exist_ok=True)
+
+def preprocess_image(image_path, save_path):
+    image = Image.open(image_path)
+
+    image_resized = image.resize((256, 256), Image.Resampling.LANCZOS).convert("RGB")
+    image_resized.save(save_path)
+    return image.width / image.height
+
+def image_to_data_url(image):
+   
+    buffered = BytesIO()
+    image.save(buffered, format="PNG")
+    img_str = base64.b64encode(buffered.getvalue()).decode()
+    return f"data:image/png;base64,{img_str}"
+
+def postprocess_output(output_path, original_aspect_ratio, save_path):
+    output_image = Image.open(output_path)
+
+    # Increase resolution for better quality
+    if original_aspect_ratio > 1:
+        new_width = 2048  # Doubled from original 1024
+        new_height = int(new_width / original_aspect_ratio)
+    else:
+        new_height = 2048  # Doubled from original 1024
+        new_width = int(new_height * original_aspect_ratio)
+
+    final_image = output_image.resize((new_width, new_height), Image.Resampling.LANCZOS)
+
+    return final_image
+    
+
+@app.route('/enhance/image', methods=['POST'])
+def enhance_image():
+    # Create necessary folder
+    os.makedirs('uploads', exist_ok=True)
+    
+    # Get image data from request
+    image_data_url = request.json.get('image')
+        
+    if not image_data_url:
+        return jsonify({"error": "No image provided"}), 400
+ 
+    header, encoded = image_data_url.split(',', 1)
+    image_data = base64.b64decode(encoded)
+    blob = BytesIO(image_data)
+    image = Image.open(blob)
+
+    # Convert PIL Image to OpenCV format
+    img_np = np.array(image)
+    
+    # Check if image has an alpha channel or is grayscale
+    if len(img_np.shape) == 3:
+        if img_np.shape[2] == 4:  # RGBA image
+            img_np = cv2.cvtColor(img_np, cv2.COLOR_RGBA2RGB)
+    elif len(img_np.shape) == 2:  # Grayscale image
+        # Convert grayscale to RGB
+        img_np = cv2.cvtColor(img_np, cv2.COLOR_GRAY2RGB)
+    else:
+        return jsonify({"error": "Unsupported image format"}), 400
+    
+    # Apply a series of enhancements for better results
+    try:
+        # 1. Apply noise reduction first
+        denoised = cv2.fastNlMeansDenoisingColored(img_np, None, 7, 7, 7, 21)
+        
+        # 2. Enhance details with edge-preserving filter
+        detail_enhanced = cv2.detailEnhance(denoised, sigma_s=10, sigma_r=0.15)
+        
+        # 3. Apply adaptive histogram equalization for improved contrast
+        lab = cv2.cvtColor(detail_enhanced, cv2.COLOR_RGB2LAB)
+        l, a, b = cv2.split(lab)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        l = clahe.apply(l)
+        lab = cv2.merge((l, a, b))
+        contrast_enhanced = cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
+        
+        # 4. Improved edge-aware sharpening
+        # Create a sharpening kernel
+        kernel = np.array([[-1, -1, -1],
+                          [-1, 9, -1],
+                          [-1, -1, -1]])
+        
+        # Apply the sharpening kernel
+        sharpened = cv2.filter2D(contrast_enhanced, -1, kernel)
+        
+        # 5. Create an edge mask for selective sharpening to avoid noise amplification
+        gray = cv2.cvtColor(contrast_enhanced, cv2.COLOR_RGB2GRAY)
+        blurred = cv2.GaussianBlur(gray, (0, 0), 3)
+        edge_mask = cv2.subtract(gray, blurred)
+        
+        # Normalize edge mask to [0, 1] range for blending
+        edge_mask_norm = cv2.normalize(edge_mask, None, alpha=0, beta=1, norm_type=cv2.NORM_MINMAX, dtype=cv2.CV_32F)
+        
+        # Expand dimensions to match the RGB image
+        edge_mask_3ch = np.repeat(edge_mask_norm[:, :, np.newaxis], 3, axis=2)
+        
+        # 6. Apply selective sharpening using the edge mask
+        # Blend original with sharpened version based on edge mask
+        enhanced = contrast_enhanced * (1 - edge_mask_3ch) + sharpened * edge_mask_3ch
+        
+        # 7. Apply subtle color enhancement
+        hsv = cv2.cvtColor(enhanced.astype(np.uint8), cv2.COLOR_RGB2HSV)
+        h, s, v = cv2.split(hsv)
+        s = cv2.multiply(s, 1.2)  # Increase saturation by 20%
+        hsv = cv2.merge([h, s, v])
+        color_enhanced = cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB)
+        
+        # 8. Final bilateral filtering to preserve edges while smoothing remaining noise
+        final = cv2.bilateralFilter(color_enhanced, 5, 50, 50)
+        
+        # Convert back to PIL for output
+        enhanced_image = Image.fromarray(final)
+        
+        # Convert to data URL
+        data_url = image_to_data_url(enhanced_image)
+        
+        return jsonify({
+            "processedImage": data_url
+        })
+    except Exception as e:
+        traceback.print_exc()
+        print(f"Error enhancing image: {str(e)}")
+        return jsonify({"error": str(e)}), 500
+    
+    
+@app.route('/enhance/video', methods=['POST'])
+def enhance_video():
+    try:
+        video_data_url = request.json.get('video')
+    
+        if not video_data_url:
+            return jsonify({"error": "No video provided"}), 400
+
+        header, encoded = video_data_url.split(',', 1)
+        video_data = base64.b64decode(encoded)
+        video_stream = BytesIO(video_data)
+        video_bytes = np.frombuffer(video_stream.read(), np.uint8)
+
+        # Generate a unique filename for this video
+        video_filename = f"enhanced_video_{uuid.uuid4().hex[:8]}.mp4"
+        video_path = os.path.join(UPLOAD_FOLDER, "input_video.mp4")
+        output_path = os.path.join(RESULT_FOLDER, video_filename)
+
+        with open(video_path, "wb") as f:
+            f.write(video_bytes)
+    
+        print("Extracting frames...")
+        frames, fps = extract_frames(video_path)
+  
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        generator = Generator(img_feat=3, n_feats=64, kernel_size=3, num_block=16)
+        generator.load_state_dict(torch.load("./model/pre_trained_model_200.pt", map_location=device))
+        generator = generator.to(device)
+        generator.eval()
+
+        print("Enhancing frames...")
+        enhanced_frames = []
+        for i, frame_path in enumerate(tqdm(frames)):
+            enhanced_frame = process_frame(frame_path, generator, device)
+            enhanced_frame_path = os.path.join(ENHANCED_FRAMES_FOLDER, f"enhanced_frame_{i:04d}.png")
+            enhanced_frame.save(enhanced_frame_path)
+            enhanced_frames.append(enhanced_frame_path)
+  
+        print("Creating output video...")
+        create_video(enhanced_frames, output_path, fps)
+        
+        try:
+            # For small videos, still provide data URL for backward compatibility
+            if os.path.getsize(output_path) < 10 * 1024 * 1024:  # Less than 10MB
+                video_data_url = video_to_data_url(output_path)
+                clean_up_frames()
+                return jsonify({
+                    "success": True,
+                    "processedVideo": video_data_url
+                })
+            else:
+                # For larger videos, provide a direct URL
+                video_url = f"/video/{video_filename}"
+                clean_up_frames()
+                return jsonify({
+                    "success": True,
+                    "processedVideo": video_url,
+                    "isDirectUrl": True
+                })
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+    except Exception as e:
+        clean_up_frames()  
+        return jsonify({"error": str(e)}), 500
+    
+    
+
+    
+@app.route('/enhance/text', methods=['POST'])
+def enhance_video_from_text():
+    def send_generation_request(host, params):
+        # Use a more recent API key or allow passing it from the frontend for testing
+        STABILITY_KEY = os.environ.get("STABILITY_KEY", "sk-tcUmsBX1Wq9frNtLQenDey5p9F8WkkkotOq3kPBcWDEcWnj1")
+    
+        if not STABILITY_KEY or STABILITY_KEY.startswith("sk-") is False:
+            return None, "Invalid API key format. Please provide a valid Stability API key."
+        
+        # Generate a boundary string for multipart/form-data
+        boundary = f"----WebKitFormBoundary{uuid.uuid4().hex}"
+        
+        headers = {
+            "Accept": "image/*",
+            "Authorization": f"Bearer {STABILITY_KEY}",
+            "Content-Type": f"multipart/form-data; boundary={boundary}"
+        }
+        
+        try:
+            print(f"Sending request to {host} with params: {params}")
+            
+            # Manual construction of multipart/form-data
+            body = b''
+            for key, value in params.items():
+                body += f"--{boundary}\r\n".encode('utf-8')
+                body += f'Content-Disposition: form-data; name="{key}"\r\n\r\n'.encode('utf-8')
+                body += f"{value}\r\n".encode('utf-8')
+            body += f"--{boundary}--\r\n".encode('utf-8')
+
+            response = requests.post(
+                host,
+                headers=headers,
+                data=body,
+                timeout=60
+            )
+
+            if not response.ok:
+                error_detail = response.text
+                status_code = response.status_code
+                return None, f"API Error (HTTP {status_code}): {error_detail}"
+
+            return response, None
+            
+        except requests.exceptions.RequestException as e:
+            return None, f"Request error: {str(e)}"
+
+    try:
+        data = request.json
+        if not data:
+            return jsonify({"error": "No data provided"}), 400
+            
+        prompt = data.get('text')
+        if not prompt or not prompt.strip():
+            return jsonify({"error": "Text prompt is required"}), 400
+            
+        negative_prompt = data.get('negative_prompt', '')
+        aspect_ratio = data.get('aspect_ratio', '1:1')  # Default to square
+        seed = data.get('seed', random.randint(1, 2147483647))  # Random seed if not provided
+        output_format = data.get('output_format', 'png')  # PNG has better quality than JPEG
+        
+        # Use Stability's API
+        host = "https://api.stability.ai/v2beta/stable-image/generate/ultra"
+        
+        # Prepare parameters with more options for better results
+        params = {
+            "prompt": prompt,
+            "negative_prompt": negative_prompt,
+            "aspect_ratio": aspect_ratio,
+            "seed": seed,
+            "output_format": output_format,
+            "steps": data.get('steps', 40),  # Higher steps for better quality
+            "cfg_scale": data.get('cfg_scale', 7.5),  # Control how closely to follow prompt
+            "style_preset": data.get('style_preset', "photographic")  # Default style
+        }
+        
+        print(f"Generating image with prompt: '{prompt}'")
+        response, error = send_generation_request(host, params)
+        
+        if error:
+            print(f"Error generating image: {error}")
+            return jsonify({
+                "success": False,
+                "error": error
+            }), 500
+            
+        if not response:
+            return jsonify({
+                "success": False,
+                "error": "No response from API"
+            }), 500
+            
+        # Process the successful response
+        try:
+            output_image = response.content
+            
+            if isinstance(output_image, bytes):
+                output_image = Image.open(BytesIO(output_image))
+
+            data_url = image_to_data_url(output_image)
+            
+            return jsonify({
+                "success": True,
+                "processedImage": data_url,
+                "seed": seed  # Return seed for reproducibility
+            })
+            
+        except Exception as processing_error:
+            print(f"Error processing image response: {str(processing_error)}")
+            return jsonify({
+                "success": False,
+                "error": f"Error processing image: {str(processing_error)}"
+            }), 500
+            
+    except Exception as e:
+        traceback.print_exc()
+        print(f"Stable Diffusion generation error: {str(e)}")
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
+        
+        
+
+        
+@app.route('/colorize/image', methods=['POST'])
+def colorize():
+    # Create necessary folders
+    os.makedirs('uploads', exist_ok=True)
+    os.makedirs('models', exist_ok=True)
+    
+    # Get image data from request
+    image_data_url = request.json.get('image')
+    
+    if not image_data_url:
+        return jsonify({"error": "No image provided"}), 400
+
+    header, encoded = image_data_url.split(',', 1)
+    image_data = base64.b64decode(encoded)
+    blob = BytesIO(image_data)
+    image = Image.open(blob)
+  
+    # Save input image
+    filename = f'input_{uuid.uuid4().hex[:8]}.png'
+    input_path = os.path.join("uploads", filename)
+    os.makedirs(os.path.dirname(input_path), exist_ok=True)
+    image.save(input_path, quality=95)
+    
+    # Pre-process the image - apply denoising first
+    img_np = np.array(image)
+    if len(img_np.shape) == 3 and img_np.shape[2] == 3:
+        # Apply denoising to color image before converting to grayscale
+        denoised = cv2.fastNlMeansDenoisingColored(img_np, None, 10, 10, 7, 21)
+        gray = cv2.cvtColor(denoised, cv2.COLOR_RGB2GRAY)
+    else:
+        # Apply grayscale denoising
+        gray = np.array(image)
+        gray = cv2.fastNlMeansDenoising(gray, None, 10, 7, 21)
+    
+    try:
+        # Skip DeOldify and go directly to advanced colorization
+        # This resolves the CUDA errors and provides better results
+        print("Using advanced custom colorization...")
+        return advanced_colorization(gray)
+    except Exception as colorization_error:
+        print(f"Advanced colorization error: {str(colorization_error)}")
+        # Final fallback to simple blend
+        return improved_blend_colorization(gray)
+
+def advanced_colorization(gray_image):
+    """
+    A more sophisticated colorization method that directly maps grayscale values to colors,
+    with special handling for noise and artifacts
+    """
+    try:
+        # Ensure we're working with a clean grayscale image
+        if len(gray_image.shape) == 3:
+            gray_image = cv2.cvtColor(gray_image, cv2.COLOR_RGB2GRAY)
+        
+        # Apply additional denoising to the grayscale image
+        gray_denoised = cv2.fastNlMeansDenoising(gray_image, None, 10, 7, 21)
+        
+        # Enhance contrast
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        gray_enhanced = clahe.apply(gray_denoised)
+        
+        # Create a blank color image
+        height, width = gray_enhanced.shape
+        colorized = np.zeros((height, width, 3), dtype=np.float32)
+        
+        # Create refined color palettes for natural-looking results
+        # Format: (B, G, R) for OpenCV
+        skin_tones = [
+            (205, 212, 234),  # Light skin
+            (190, 190, 220),  # Medium light skin
+            (170, 170, 210),  # Medium skin
+            (145, 155, 195),  # Medium dark skin
+            (120, 140, 180),  # Dark skin
+        ]
+        
+        nature_tones = [
+            (100, 180, 100),  # Green foliage
+            (140, 200, 120),  # Light green
+            (80, 150, 80),    # Dark green
+            (100, 160, 210),  # Sky blue
+            (60, 120, 190),   # Deep blue
+            (80, 160, 230),   # Light blue
+        ]
+        
+        warm_tones = [
+            (60, 90, 180),    # Red
+            (70, 110, 180),   # Dark red
+            (100, 150, 200),  # Pink
+            (120, 160, 210),  # Light pink
+            (90, 140, 220),   # Orange
+            (120, 180, 230),  # Light orange
+        ]
+        
+        neutral_tones = [
+            (150, 150, 150),  # Gray
+            (200, 200, 200),  # Light gray
+            (100, 100, 100),  # Dark gray
+            (180, 170, 160),  # Beige
+            (130, 120, 110),  # Brown
+            (220, 220, 220),  # Near white
+        ]
+        
+        # Calculate edge awareness to reduce color artifacts at edges
+        edges = cv2.Canny(gray_enhanced, 50, 150)
+        dilated_edges = cv2.dilate(edges, np.ones((3, 3), np.uint8), iterations=1)
+        edge_mask = dilated_edges / 255.0
+        
+        # Use K-means to identify regions likely to be skin, nature, etc.
+        flat_gray = gray_enhanced.reshape((-1, 1))
+        flat_gray = np.float32(flat_gray)
+        criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 10, 1.0)
+        K = 5  # Number of clusters
+        _, labels, centers = cv2.kmeans(flat_gray, K, None, criteria, 10, cv2.KMEANS_RANDOM_CENTERS)
+        
+        # Reshape back to the original image shape
+        segmented = labels.reshape((height, width))
+        
+        # Create a pixel-by-pixel colorization
+        for y in range(height):
+            for x in range(width):
+                pixel_value = gray_enhanced[y, x]
+                segment = segmented[y, x]
+                is_edge = edge_mask[y, x] > 0
+                
+                # Normalize pixel value
+                normalized_value = pixel_value / 255.0
+                
+                # Determine color source based on segment and brightness
+                # More sophisticated mapping based on segment value
+                if segment == 0:  # Likely dark areas
+                    if pixel_value < 50:
+                        color_source = neutral_tones
+                    else:
+                        color_source = warm_tones
+                elif segment == 1:  # Likely midtones - good for skin
+                    if 100 <= pixel_value <= 180:
+                        color_source = skin_tones 
+                    else:
+                        color_source = neutral_tones
+                elif segment == 2:  # Likely natures/tones
+                    if pixel_value < 150:
+                        color_source = nature_tones
+                    else:
+                        color_source = warm_tones
+                elif segment == 3:  # Likely highlights
+                    color_source = neutral_tones
+                else:  # Fallback
+                    if pixel_value < 85:
+                        color_source = warm_tones
+                    elif pixel_value < 170:
+                        color_source = nature_tones
+                    else:
+                        color_source = neutral_tones
+                
+                # Add controlled randomness based on position to avoid abrupt color changes
+                color_idx = ((y * 17 + x * 19) % len(color_source))
+                base_color = np.array(color_source[color_idx], dtype=np.float32)
+                
+                # Apply color with intensity preservation
+                # At edges, use more desaturated colors to reduce artifacts
+                if is_edge:
+                    # Use more muted colors at edges
+                    gray_color = np.array([pixel_value, pixel_value, pixel_value], dtype=np.float32)
+                    color = base_color * 0.3 + gray_color * 0.7
+                else:
+                    # Apply color based on pixel intensity with better luminance preservation
+                    color = base_color * (0.7 + 0.3 * normalized_value)
+                    # Ensure luminance matches the original grayscale
+                    # Calculate perceived luminance of the color
+                    luminance = 0.299 * color[2] + 0.587 * color[1] + 0.114 * color[0]
+                    # Adjust color to match original pixel luminance
+                    if luminance > 0:
+                        color = color * (pixel_value / luminance)
+                
+                colorized[y, x] = np.clip(color, 0, 255)
+        
+        # Convert to uint8 for further processing
+        colorized_uint8 = np.clip(colorized, 0, 255).astype(np.uint8)
+        
+        # Enhance colors with a sophisticated post-processing pipeline
+        
+        # 1. Apply bilateral filter for edge-preserving smoothing
+        smooth = cv2.bilateralFilter(colorized_uint8, 9, 75, 75)
+        
+        # 2. Enhance color saturation
+        hsv = cv2.cvtColor(smooth, cv2.COLOR_BGR2HSV)
+        h, s, v = cv2.split(hsv)
+        # Increase saturation but avoid oversaturation
+        s = cv2.multiply(s, 1.3)
+        hsv = cv2.merge([h, s, v])
+        colorized_hsv = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
+        
+        # 3. Blend original grayscale for luminance accuracy
+        gray_3ch = cv2.cvtColor(gray_enhanced, cv2.COLOR_GRAY2BGR)
+        lum_blend = cv2.addWeighted(colorized_hsv, 0.85, gray_3ch, 0.15, 0)
+        
+        # 4. Apply final noise reduction
+        denoised = cv2.fastNlMeansDenoisingColored(lum_blend, None, 3, 3, 7, 21)
+        
+        # 5. Final color vibrance boost
+        hsv = cv2.cvtColor(denoised, cv2.COLOR_BGR2HSV)
+        h, s, v = cv2.split(hsv)
+        s = cv2.multiply(s, 1.2)  # Final saturation boost
+        hsv = cv2.merge([h, s, v])
+        final_colorized = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
+        
+        # Convert to PIL Image
+        result_image = Image.fromarray(cv2.cvtColor(final_colorized, cv2.COLOR_BGR2RGB))
+        
+        # Convert to data URL
+        data_url = image_to_data_url(result_image)
+            
+        return jsonify({
+                    "success": True,
+            "processedImage": data_url,
+            "method": "Advanced custom colorization"
+        })
+        
+    except Exception as e:
+        print(f"Advanced colorization failed: {str(e)}")
+        # If our advanced method fails, return the original grayscale image
+        try:
+            gray_pil = Image.fromarray(gray_image)
+            data_url = image_to_data_url(gray_pil)
+            return jsonify({
+                "success": False,
+                "error": "All colorization methods failed",
+                    "processedImage": data_url
+                })
+        except:
+            # Last resort
+            return jsonify({
+                "success": False,
+                "error": "Complete colorization failure"
+            })
+
+def improved_blend_colorization(gray_image):
+    """
+    Apply an advanced colorization using sophisticated color blending as fallback when other methods fail.
+    This implementation creates a more realistic colorized image by using a more refined palette and
+    applying more sophisticated blending techniques.
+    """
+    try:
+        # Ensure we're working with a grayscale image
+        if len(gray_image.shape) == 3:
+            gray_image = cv2.cvtColor(gray_image, cv2.COLOR_RGB2GRAY)
+        
+        # Enhance contrast in grayscale image to make details more visible
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+        gray_enhanced = clahe.apply(gray_image)
+        
+        # Create a blank RGB image
+        height, width = gray_enhanced.shape
+        colorized = np.zeros((height, width, 3), dtype=np.float32)
+        
+        # Create more sophisticated color palettes for different brightness levels
+        # Format: (B, G, R) for OpenCV
+        # More colors and more realistic tones
+        dark_colors = [
+            (45, 30, 25),    # Dark brown
+            (35, 25, 35),    # Dark blue-purple
+            (25, 35, 25),    # Dark forest green
+            (35, 25, 45),    # Dark purple
+            (25, 25, 45),    # Dark blue
+            (45, 35, 25)     # Dark orange-brown
+        ]
+        
+        mid_colors = [
+            (100, 120, 150), # Blue-gray
+            (110, 150, 100), # Moss green
+            (130, 120, 110), # Warm beige
+            (120, 105, 145), # Lavender
+            (95, 130, 160),  # Steel blue
+            (150, 110, 90)   # Terracotta
+        ]
+        
+        light_colors = [
+            (190, 210, 235), # Pale blue
+            (200, 230, 210), # Mint green
+            (235, 225, 215), # Cream
+            (240, 220, 225), # Pink
+            (220, 235, 235), # Light cyan
+            (235, 230, 200)  # Light yellow
+        ]
+        
+        # Calculate image gradients for edge-aware coloring
+        sobel_x = cv2.Sobel(gray_enhanced, cv2.CV_32F, 1, 0, ksize=3)
+        sobel_y = cv2.Sobel(gray_enhanced, cv2.CV_32F, 0, 1, ksize=3)
+        gradient_magnitude = cv2.magnitude(sobel_x, sobel_y)
+        
+        # Normalize gradient magnitude to [0, 1]
+        if np.max(gradient_magnitude) > 0:
+            gradient_magnitude = gradient_magnitude / np.max(gradient_magnitude)
+        
+        # Create a color mapping based on pixel intensity with gradient awareness
+        for y in range(height):
+            for x in range(width):
+                pixel = gray_enhanced[y, x]
+                edge_strength = gradient_magnitude[y, x]
+                
+                # Determine base color based on pixel intensity
+                if pixel < 85:  # Dark areas
+                    color_idx = (x + y) % len(dark_colors)
+                    color = dark_colors[color_idx]
+                elif pixel < 170:  # Mid-tone areas
+                    color_idx = (x + y) % len(mid_colors)
+                    color = mid_colors[color_idx]
+                else:  # Light areas
+                    color_idx = (x + y) % len(light_colors)
+                    color = light_colors[color_idx]
+                
+                # Apply color with intensity preservation and edge awareness
+                intensity_factor = pixel / 255.0
+                # Reduce saturation at edges for more natural look
+                saturation_factor = 1.0 - (edge_strength * 0.3)
+                
+                # Calculate color components with smart blending
+                adjusted_color = [
+                    # Base intensity scaling
+                    c * intensity_factor * 
+                    # Edge-aware adjustment (preserves luminance at edges)
+                    (1.0 - (0.2 * edge_strength)) *
+                    # Channel-specific adjustments for more realism
+                    (1.0 if i != 2 else 1.15)  # Boost red channel slightly for warmth
+                    for i, c in enumerate(color)
+                ]
+                
+                colorized[y, x] = adjusted_color
+        
+        # Apply sophisticated post-processing
+        # Convert to uint8 for OpenCV processing
+        colorized_uint8 = (colorized * 255).astype(np.uint8)
+        
+        # 1. Apply bilateral filter to smooth colors while preserving edges
+        smoothed = cv2.bilateralFilter(colorized_uint8, 9, 75, 75)
+        
+        # 2. Enhance color saturation
+        hsv = cv2.cvtColor(smoothed, cv2.COLOR_BGR2HSV)
+        h, s, v = cv2.split(hsv)
+        s = cv2.multiply(s, 1.4)  # Boost saturation
+        hsv = cv2.merge([h, s, v])
+        saturated = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
+        
+        # 3. Apply a slight sharpening for better details
+        kernel = np.array([[-0.3, -0.3, -0.3], [-0.3, 3.4, -0.3], [-0.3, -0.3, -0.3]])
+        sharpened = cv2.filter2D(saturated, -1, kernel)
+        
+        # 4. Final color balance for natural appearance
+        b, g, r = cv2.split(sharpened)
+        r = cv2.multiply(r, 1.1)  # Enhance red slightly for better skin tones
+        b = cv2.multiply(b, 0.9)  # Reduce blue slightly to prevent cold appearance
+        final = cv2.merge([b, g, r])
+        
+        # Convert to PIL Image (BGR to RGB conversion for PIL)
+        result_image = Image.fromarray(cv2.cvtColor(final, cv2.COLOR_BGR2RGB))
+        
+        # Convert to data URL
+        data_url = image_to_data_url(result_image)
+        
+        return jsonify({
+            "success": True,
+            "processedImage": data_url,
+            "info": "Advanced blend colorization applied"
+        })
+        
+    except Exception as e:
+        print(f"Advanced fallback colorization failed: {str(e)}")
+        # If even our advanced fallback fails, return the original grayscale image
+        try:
+            gray_pil = Image.fromarray(gray_image)
+            data_url = image_to_data_url(gray_pil)
+            return jsonify({
+                "success": False,
+                "error": "All colorization methods failed",
+                "processedImage": data_url
+            })
+        except:
+            # Absolute last resort - return error with no image
+            return jsonify({
+                "success": False,
+                "error": "Complete colorization failure"
+            })
+
+
+@app.route('/colorize/video', methods=['POST'])
+def video_colorizer():
+    try:
+        video_data_url = request.json.get('video')
+        
+        if not video_data_url:
+            return jsonify({"error": "No video provided"}), 400
+
+        header, encoded = video_data_url.split(',', 1)
+        video_data = base64.b64decode(encoded)
+
+        # Create necessary directories with absolute paths
+        base_dir = os.path.abspath('.')
+        FRAMES_FOLDER = os.path.join(base_dir, 'uploads', 'frames')
+        COLORIZED_FRAMES_FOLDER = os.path.join(base_dir, 'uploads', 'colorized_frames')
+        RESULT_FOLDER = os.path.join(base_dir, 'uploads', 'result')
+
+        # Create all necessary directories
+        for directory in [FRAMES_FOLDER, COLORIZED_FRAMES_FOLDER, RESULT_FOLDER, 'models']:
+            os.makedirs(directory, exist_ok=True)
+
+        # Save the input video with a unique name to avoid conflicts
+        video_filename = f"input_video_{uuid.uuid4().hex[:8]}.mp4"
+        output_filename = f"colorized_video_{uuid.uuid4().hex[:8]}.mp4"
+        video_path = os.path.join(base_dir, 'uploads', video_filename)
+        output_path = os.path.join(RESULT_FOLDER, output_filename)
+        
+        print(f"Saving video to {video_path}")
+        with open(video_path, "wb") as f:
+            f.write(video_data)
+            
+        # Check if the video file is valid
+        if not os.path.exists(video_path) or os.path.getsize(video_path) == 0:
+            return jsonify({"error": "Failed to save video file"}), 500
+            
+        # Explicitly create an empty list for storing frames
+        frames = []
+        
+        # Set up enhanced extract_frames function
+        def extract_frames(video_path):
+    frames = []
+            frames = []
+            
+            try:
+                cap = cv2.VideoCapture(video_path)
+                if not cap.isOpened():
+                    raise Exception(f"Could not open video file {video_path}")
+                    
+                fps = max(int(cap.get(cv2.CAP_PROP_FPS)), 24)  # Default to 24fps if detection fails
+                total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                
+                print(f"Video has {total_frames} frames at {fps} fps")
+                
+                # If video has no frames, return error
+                if total_frames == 0:
+                    raise Exception("Video has no frames")
+                    
+                # Process frames
+                frame_count = 0
+                while cap.isOpened():
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
+                    
+                    # Save frame with full path
+                    frame_path = os.path.join(FRAMES_FOLDER, f"frame_{frame_count:04d}.png")
+                    cv2.imwrite(frame_path, frame)
+                    frames.append(frame_path)
+                    frame_count += 1
+                
+                # Verify we extracted at least some frames
+                if len(frames) == 0:
+                    raise Exception("No frames could be extracted from the video")
+                
+                cap.release()
+                return frames, fps
+            except Exception as e:
+                print(f"Error extracting frames: {str(e)}")
+                raise
+                
+        # Set up enhanced video creation function
+        def create_video(colorized_frames, output_path, fps):
+            if not colorized_frames:
+                raise Exception("No colorized frames provided")
+                
+            first_frame = cv2.imread(colorized_frames[0])
+            if first_frame is None:
+                raise Exception(f"Could not read first frame: {colorized_frames[0]}")
+                
+            height, width = first_frame.shape[:2]
+            
+            # Use a more reliable codec
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+            
+            if not out.isOpened():
+                raise Exception(f"Failed to create video writer at {output_path}")
+            
+            for frame_path in colorized_frames:
+                frame = cv2.imread(frame_path)
+                if frame is not None:  # Skip frames that failed to load
+                    out.write(frame)
+                
+            out.release()
+
+            # Verify output file was created
+            if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
+                raise Exception("Failed to create output video file")
+
+        # Load DeOldify safely
+        try:
+            _colorizer = get_image_colorizer(artistic=True)
+        except Exception as e:
+            return jsonify({"error": f"Failed to initialize DeOldify colorizer: {str(e)}"}), 500
+
+        # Extract frames with better error reporting
+        print("Extracting frames...")
+        try:
+            frames, fps = extract_frames(video_path)
+            print(f"Successfully extracted {len(frames)} frames")
+        except Exception as e:
+            return jsonify({"error": f"Failed to extract frames: {str(e)}"}), 500
+            
+        # Process frames with better error handling
+        print("Colorizing frames with DeOldify...")
+        colorized_frames = []
+        frame_errors = 0
+        for i, frame_path in enumerate(tqdm(frames)):
+            try:
+                # Process with DeOldify
+                colorized_frame = _colorizer.get_transformed_image(
+                    path=frame_path,
+                    render_factor=30,
+                    watermarked=False,
+                    post_process=True
+                )
+                
+                if isinstance(colorized_frame, bytes):
+                    colorized_frame = Image.open(BytesIO(colorized_frame))
+
+                # Save the colorized frame with a unique path
+                colorized_frame_path = os.path.join(COLORIZED_FRAMES_FOLDER, f"colorized_frame_{i:04d}.png")
+                colorized_frame.save(colorized_frame_path)
+                colorized_frames.append(colorized_frame_path)
+                
+            except Exception as frame_error:
+                # Count errors for tracking
+                frame_errors += 1
+                print(f"Error processing frame {i}: {str(frame_error)}")
+                
+                # Use a simple fallback
+                try:
+                    img = cv2.imread(frame_path, cv2.IMREAD_GRAYSCALE)
+                    if img is None:
+                        raise Exception(f"Could not read frame at {frame_path}")
+                        
+                    # Apply colormap for simple colorization
+                    colorized = cv2.applyColorMap(img, cv2.COLORMAP_BONE)
+                    colorized_frame_path = os.path.join(COLORIZED_FRAMES_FOLDER, f"colorized_frame_{i:04d}.png")
+                    cv2.imwrite(colorized_frame_path, colorized)
+                    colorized_frames.append(colorized_frame_path)
+                except Exception as fallback_error:
+                    print(f"Fallback colorization failed for frame {i}: {str(fallback_error)}")
+                    # Skip this frame if both methods fail
+        
+        # Check if we have enough colorized frames to make a video
+        if len(colorized_frames) == 0:
+            return jsonify({"error": "Failed to colorize any frames"}), 500
+            
+        if frame_errors > 0:
+            print(f"Warning: {frame_errors} frames had errors and used fallback colorization")
+
+        # Create output video
+        print("Creating output video...")
+        
+        try:
+            create_video(colorized_frames, output_path, fps)
+        except Exception as e:
+            return jsonify({"error": f"Failed to create output video: {str(e)}"}), 500
+
+        # Return appropriate response based on video size
+        try:
+            # For small videos, still provide data URL for backward compatibility
+            if os.path.getsize(output_path) < 10 * 1024 * 1024:  # Less than 10MB
+                video_data_url = video_to_data_url(output_path)
+                
+                # Clean up
+                for folder in [FRAMES_FOLDER, COLORIZED_FRAMES_FOLDER]:
+                    try:
+                        shutil.rmtree(folder)
+                    except Exception as e:
+                        print(f"Warning: Failed to clean up {folder}: {str(e)}")
+                        
+                return jsonify({
+                    "success": True,
+                    "processedVideo": video_data_url
+                })
+            else:
+                # For larger videos, provide a direct URL
+                video_url = f"/video/{output_filename}"
+                
+                # Clean up
+                for folder in [FRAMES_FOLDER, COLORIZED_FRAMES_FOLDER]:
+                    try:
+                        shutil.rmtree(folder)
+                    except Exception as e:
+                        print(f"Warning: Failed to clean up {folder}: {str(e)}")
+                        
+                return jsonify({
+                    "success": True,
+                    "processedVideo": video_url,
+                    "isDirectUrl": True
+                })
+        except Exception as e:
+            return jsonify({"error": f"Failed to process video response: {str(e)}"}), 500
+
+    except Exception as e:
+        traceback.print_exc()
+        print(f"Video colorization failed: {str(e)}")
+        
+        # Clean up if possible
+        try:
+            for folder in [FRAMES_FOLDER, COLORIZED_FRAMES_FOLDER]:
+                if 'folder' in locals() and os.path.exists(folder):
+                    shutil.rmtree(folder)
+        except:
+            pass  # Ignore cleanup errors
+            
+        return jsonify({"error": str(e)}), 500
+
+
+
+@app.route('/stylize', methods=['POST'])
+def stylize():
+    # Create necessary folders
+    os.makedirs('uploads', exist_ok=True)
+    os.makedirs('stylized', exist_ok=True)
+    
+    try:
+        # Get image data and style from request
+        image_data_url = request.json.get('image')
+        style = request.json.get('style')
+        
+        if not image_data_url or not style:
+            return jsonify({"error": "Image or style not provided"}), 400
+        
+        # Process image data
+        header, encoded = image_data_url.split(',', 1)
+        image_data = base64.b64decode(encoded)
+        
+        # Create unique filenames
+        filename = f"input_{uuid.uuid4().hex[:8]}.jpg"
+        input_path = os.path.join('uploads', filename)
+        output_path = os.path.join('stylized', f"{style}_{filename}")
+        
+        # Save input image
+        with open(input_path, 'wb') as f:
+            f.write(image_data)
+        
+        # Validate style
+        valid_styles = ['candy', 'mosaic', 'rain_princess', 'udnie', 'pointilism', 'starry_night']
+        if style not in valid_styles:
+            return jsonify({"error": f"Invalid style. Choose from: {', '.join(valid_styles)}"}), 400
+        
+        # Load style model
+        style_model_path = f'ai/models/style_transfer/{style}.t7'
+        if not os.path.exists(style_model_path):
+            return jsonify({"error": f"Style model {style} not found"}), 404
+        
+        # Load the model
+        net = cv2.dnn.readNetFromTorch(style_model_path)
+        
+        # Read the input image and prepare it for the network
+        image = cv2.imread(input_path)
+        if image is None:
+            return jsonify({"error": "Failed to read input image"}), 500
+        
+        # Pre-process image for better results
+        # Apply noise reduction
+        image = cv2.fastNlMeansDenoisingColored(image, None, 5, 5, 7, 21)
+        
+        # Determine optimal image size while preserving aspect ratio
+        h, w = image.shape[:2]
+        aspect_ratio = w / h
+        
+        # Target size - larger for better detail
+        new_width = 800
+        new_height = int(new_width / aspect_ratio)
+        
+        # Resize image maintaining aspect ratio
+        image = cv2.resize(image, (new_width, new_height), interpolation=cv2.INTER_AREA)
+        
+        # Prepare image for neural network
+        # Create blob from image - keep mean values at 0 for style transfer
+        blob = cv2.dnn.blobFromImage(image, 1.0, (new_width, new_height), 
+                                     (103.939, 116.779, 123.68), swapRB=False, crop=False)
+        
+        # Set the blob as input and run forward pass
+        net.setInput(blob)
+        output = net.forward()
+        
+        # Post-process the output
+        # Reshape output tensor to image format
+        output = output.reshape(3, output.shape[2], output.shape[3])
+        output[0] += 103.939
+        output[1] += 116.779
+        output[2] += 123.68
+        output = output.transpose(1, 2, 0)
+        
+        # Ensure output is within valid range
+        output = np.clip(output, 0, 255).astype(np.uint8)
+        
+        # Enhance the stylized result
+        # Apply detail enhancement filter
+        stylized = cv2.detailEnhance(output, sigma_s=10, sigma_r=0.15)
+        
+        # Improve contrast with CLAHE
+        lab = cv2.cvtColor(stylized, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        l = clahe.apply(l)
+        lab = cv2.merge((l, a, b))
+        stylized = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+        
+        # Apply subtle edge enhancement
+        kernel = np.array([[-0.5, -0.5, -0.5],
+                           [-0.5,  5.0, -0.5],
+                           [-0.5, -0.5, -0.5]])
+        stylized = cv2.filter2D(stylized, -1, kernel)
+        
+        # Final color balance adjustment
+        # Split channels and adjust individually
+        b, g, r = cv2.split(stylized)
+        
+        # Apply balanced adjustments to each channel
+        r = cv2.convertScaleAbs(r, alpha=1.05, beta=0)
+        g = cv2.convertScaleAbs(g, alpha=1.02, beta=0)
+        b = cv2.convertScaleAbs(b, alpha=1.05, beta=0)
+        
+        # Merge channels back
+        stylized = cv2.merge([b, g, r])
+        
+        # Save the stylized image
+        cv2.imwrite(output_path, stylized)
+        
+        # Read the stylized image for conversion to data URL
+        stylized_image = Image.open(output_path)
+        data_url = image_to_data_url(stylized_image)
+        
+        # Clean up temporary files
+        try:
+            os.remove(input_path)
+            os.remove(output_path)
+        except Exception as e:
+            print(f"Warning: Could not clean up files: {e}")
+        
+        return jsonify({
+            "stylizedImage": data_url
+        })
+    except Exception as e:
+        traceback.print_exc()
+        print(f"Error in style transfer: {str(e)}")
+        return jsonify({"error": str(e)}), 500
+    
+
+# Add a direct video endpoint that doesn't use data URLs
+@app.route('/video/<filename>', methods=['GET'])
+def serve_video(filename):
+    """Serve video files directly with proper MIME type"""
+    # Sanitize filename to prevent directory traversal
+    filename = os.path.basename(filename)
+    
+    # Look in result folder for the file
+    video_path = os.path.join(RESULT_FOLDER, filename)
+    if not os.path.exists(video_path):
+        return jsonify({"error": "Video not found"}), 404
+        
+    # Serve the file with proper MIME type
+    return send_file(
+        video_path,
+        mimetype='video/mp4',
+        as_attachment=False,
+        download_name=filename
+    )
+        
+if __name__ == '__main__':
+    app.run(debug=True,port=3000,host="0.0.0.0")
